@@ -119,7 +119,7 @@ export default class {
       }
     } else if (data.type == 'error') {
       if (data.reason == 'authorization') {
-        this.logOut()
+        Auth.logOut()
       }
       throw data
     }
