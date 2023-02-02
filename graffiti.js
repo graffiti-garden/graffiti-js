@@ -1,16 +1,23 @@
-import Auth from './auth.js'
+import Auth from './src/auth.js'
+//import Collection from './src/collection.js'
 
 export default class {
 
-  constructor(graffitiURL="https://graffiti.garden") {
+  // There needs to be a new object map for each tag
+  constructor(
+    graffitiURL="https://graffiti.garden",
+    objectMapConstructor=()=>({})) {
+
     this.graffitiURL = graffitiURL
+    this.objectMapConstructor = objectMapConstructor
     this.open = false
-    this.subscriptionData = {}
     this.eventTarget = new EventTarget()
+    this.tagMap = {}
+
+    this.#initialize()
   }
 
-  // CALL THIS BEFORE DOING ANYTHING ELSE
-  async initialize() {
+  async #initialize() {
     // Perform authorization
     this.authParams = await Auth.connect(this.graffitiURL)
 
@@ -26,15 +33,23 @@ export default class {
       this.wsURL.searchParams.set("token", this.authParams.token)
     }
 
-    // And commence connection
-    this.connect()
+    // Commence connection
+    this.#connect()
   }
 
-  connect() {
+  async opened() {
+    if (!this.open) {
+      await new Promise(resolve => {
+        this.eventTarget.addEventListener("graffitiOpen", () => resolve() )
+      })
+    }
+  }
+
+  #connect() {
     this.ws = new WebSocket(this.wsURL)
-    this.ws.onmessage = this.onMessage.bind(this)
-    this.ws.onclose   = this.onClose.bind(this)
-    this.ws.onopen    = this.onOpen.bind(this)
+    this.ws.onmessage = this.#onMessage.bind(this)
+    this.ws.onclose   = this.#onClose.bind(this)
+    this.ws.onopen    = this.#onOpen.bind(this)
   }
 
   // authorization functions
@@ -43,14 +58,18 @@ export default class {
     this.myID? Auth.logOut() : Auth.logIn(this.graffitiURL)
   }
 
-  async onClose() {
+  async #onClose() {
     this.open = false
     console.error("lost connection to graffiti server, attemping reconnect soon...")
     await new Promise(resolve => setTimeout(resolve, 2000))
-    this.connect()
+    this.#connect()
   }
 
-  async request(msg) {
+  async #request(msg) {
+    if (!this.open) {
+      throw { 'error': 'Not connected!' }
+    }
+
     // Create a random message ID
     const messageID = crypto.randomUUID()
 
@@ -60,13 +79,6 @@ export default class {
         resolve(e.data)
       })
     })
-
-    // Wait for the socket to open
-    if (!this.open) {
-      await new Promise(resolve => {
-        this.eventTarget.addEventListener("graffitiOpen", () => resolve() )
-      })
-    }
 
     // Send the request
     msg.messageID = messageID
@@ -79,11 +91,11 @@ export default class {
     if (data.type == 'error') {
       throw data
     } else {
-      return data
+      return data['reply']
     }
   }
 
-  onMessage(event) {
+  #onMessage(event) {
     const data = JSON.parse(event.data)
 
     if ('messageID' in data) {
@@ -93,30 +105,12 @@ export default class {
       messageEvent.data = data
       this.eventTarget.dispatchEvent(messageEvent)
 
-    } else if (['updates', 'removes'].includes(data.type)) {
-      // Subscription data
-      if (data.queryID in this.subscriptionData) {
-        const sd = this.subscriptionData[data.queryID]
+    } else if ('update' in data) {
+      this.#updateCallback(data['update'])
 
-        // For each data point, either add or remove it
-        for (const r of data.results) {
-          if (data.type == 'updates') {
-            sd.updateCallback(r)
-          } else {
-            sd.removeCallback(r)
-          }
-        }
+    } else if ('remove' in data) {
+      this.#removeCallback(data['remove'])
 
-        // And update this query's notion of "now"
-        if (data.complete) {
-          if (data.historical) {
-            sd.historyComplete = true
-          }
-          if (sd.historyComplete) {
-            sd.since = data.now
-          }
-        }
-      }
     } else if (data.type == 'error') {
       if (data.reason == 'authorization') {
         Auth.logOut()
@@ -125,66 +119,54 @@ export default class {
     }
   }
 
-  async update(object, query) {
-    const data = await this.request({ object, query })
-    return data.objectID
-  }
+  #updateCallback(object) {
+    const uuid = this.#objectUUID(object)
 
-  async remove(objectID) {
-    await this.request({ objectID })
-  }
+    let originalObject = null
+    for (const tag in this.tagMap) {
+      const objectMap = this.tagMap[tag].objectMap
 
-  async subscribe(
-    query,
-    updateCallback,
-    removeCallback,
-    flags={},
-    since=null,
-    queryID=null) {
+      if (uuid in objectMap) {
+        // Copy the original object if
+        // one exists, in case of failure
+        originalObject = Object.assign({},objectMap[uuid])
 
-    // Create a random query ID
-    if (!queryID) queryID = crypto.randomUUID()
+        // Replace the object by copying
+        // so references to it don't break
+        this.#recursiveCopy(objectMap[uuid], object)
+      } else {
 
-    // Send the request
-    await this.request({ queryID, query, since, ...flags })
-
-    // Store the subscription in case of disconnections
-    this.subscriptionData[queryID] = {
-      query, since, flags, updateCallback, removeCallback,
-      historyComplete: false
+        // Add properties to the object
+        // so it can be updated and removed
+        // without the collection
+        Object.defineProperty(object, '_update', { value: ()=>this.update(object) })
+        Object.defineProperty(object, '_remove', { value: ()=>this.remove(object) })
+        objectMap[uuid] = object
+      }
     }
 
-    return queryID
+    // Return the original in case of failure
+    return originalObject
   }
 
-  async unsubscribe(queryID) {
-    // Remove allocated space
-    delete this.subscriptionData[queryID]
+  #removeCallback(object) {
+    const uuid = this.#objectUUID(object)
 
-    // And unsubscribe
-    const data = await this.request({ queryID })
-  }
+    let originalObject = null
+    for (const tag in this.tagMap) {
+      const objectMap = this.tagMap[tag].objectMap
 
-  async onOpen() {
-    console.log("connected to the graffiti socket")
-    this.open = true
-    this.eventTarget.dispatchEvent(new Event("graffitiOpen"))
-    // Resubscribe to hanging queries
-    for (const queryID in this.subscriptionData) {
-      const sd = this.subscriptionData[queryID]
-      await this.subscribe(
-        sd.query,
-        sd.updateCallback,
-        sd.removeCallback,
-        sd.flags,
-        sd.since,
-        queryID)
+      if (!(uuid in objectMap)) return
+      originalObject = Object.assign({},objectMap[uuid])
+      delete objectMap[uuid]
     }
   }
 
-  // Adds required fields to an object.
-  // You should probably call this before 'update'
-  completeObject(object) {
+  async update(object) {
+    if (!this.myID) {
+      throw 'you can\'t update objects without logging in!'
+    }
+
     // Add by/to fields
     object._by = this.myID
     if ('_to' in object && !Array.isArray(object._to)) {
@@ -192,20 +174,157 @@ export default class {
     }
 
     // Pre-generate the object's ID if it does not already exist
-    if (!object._id) object._id = crypto.randomUUID()
+    if (!object._key) object._key = crypto.randomUUID()
+
+    // Immediately replace the object
+    const originalObject = this.#updateCallback(object)
+
+    // Send it to the server
+    try {
+      await this.#request({ update: object })
+    } catch(e) {
+      if (originalObject) {
+        // Restore the original object
+        this.#updateCallback(originalObject)
+      } else {
+        // Delete the temp object
+        this.#removeCallback(object)
+      }
+      throw e
+    }
+  }
+
+  async remove(object) {
+    if (!this.myID) {
+      throw 'you can\'t remove objects without logging in!'
+    }
+
+    if (this.myID != object._by) {
+      throw 'you can\'t remove an object that isn\'t yours!'
+    }
+
+    // Immediately remove the object
+    // but store it in case there is an error
+    const originalObject = this.#removeCallback(object)
+
+    try {
+      return await this.#request({ remove: object._key })
+    } catch(e) {
+      // Delete failed, restore the object
+      if (originalObject) this.#updateCallback(originalObject)
+      throw e
+    }
+  }
+
+  async myTags() {
+    return await this.#request({ ls: null })
+  }
+
+  async objectByKey(userID, objectKey) {
+    return await this.#request({ get: {
+      _by: userID,
+      _key: objectKey
+    }})
+  }
+
+  objectsByTags(...tags) {
+    for (const tag of tags) {
+      if (!(tag in this.tagMap)) {
+        throw `You are not subscribed to '${tag}'`
+      }
+    }
+
+    // Merge by UUID to combine all the maps
+    const combinedMaps = Object.assign({},
+      ...tags.map(tag=> this.tagMap[tag].objectMap))
+
+    // Return just the array
+    return Object.values(combinedMaps)
+  }
+
+  async subscribe(...tags) {
+    // Look at what is already subscribed to
+    const subscribingTags = []
+    for (const tag of tags) {
+      if (tag in this.tagMap) {
+        // Increase the count
+        this.tagMap[tag].count++
+      } else {
+        // Create a new slot
+        this.tagMap[tag] = {
+          objectMap: this.objectMapConstructor(),
+          count: 1
+        }
+        subscribingTags.push(tag)
+      }
+    }
+
+    // Begin subscribing in the background
+    if (subscribingTags.length)
+      await this.#request({ subscribe: subscribingTags })
+  }
+
+  async unsubscribe(...tags) {
+    // Decrease the count of each tag,
+    // removing and marking if necessary
+    const unsubscribingTags = []
+    for (const tag of tags) {
+      this.tagMap[tag].count--
+
+      if (!this.tagMap[tag].count) {
+        unsubscribingTags.push(tag)
+        delete this.tagMap[tag]
+      }
+    }
+
+    // Unsubscribe from all remaining tags
+    if (unsubscribingTags.length)
+      await this.#request({ unsubscribe: unsubscribingTags })
+  }
+
+  async #onOpen() {
+    console.log("connected to the graffiti socket")
+    this.open = true
+    this.eventTarget.dispatchEvent(new Event("graffitiOpen"))
+
+    // Clear data
+    for (let tag in this.tagMap) {
+      const objectMap = this.tagMap[tag].objectMap
+      for (let uuid in objectMap) delete objectMap[uuid]
+    }
+
+    // Resubscribe
+    const tags = Object.keys(this.tagMap)
+    if (tags.length) await this.#request({ subscribe: tags })
   }
 
   // Utility function to get a universally unique string
   // that represents a particular object
-  objectUUID(object) {
-    if (!object._id || !object._by) {
+  #objectUUID(object) {
+    if (!object._by || !object._key) {
       throw {
         type: 'error',
-        content: 'the object you are trying to identify does not have an ID or owner',
+        content: 'the object you are trying to identify does not have an owner or key',
         object
       }
     }
-    return object._id + object._by
+    return object._by + object._key
   }
 
+  #recursiveCopy(target, source) {
+    for (const field in target) {
+      if (!(field in source)) {
+        delete target[field]
+      }
+    }
+
+    for (const field in source) {
+      if (field in target && typeof target[field] == 'object' && typeof source[field] == 'object') {
+        this.#recursiveCopy(target[field], source[field])
+      } else {
+        target[field] = source[field]
+      }
+    }
+  }
 }
+
