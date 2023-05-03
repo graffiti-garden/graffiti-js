@@ -76,7 +76,11 @@ export default class TorrentMedia {
     const fetches = []
     for (const hash of await this.db.getAllKeys(this.cacheNS)) {
       const torrentData = await this.db.get(this.cacheNS, hash)
-      await this.#fetchTorrentFile(new Blob([torrentData]))
+      try {
+        await this.#fetchTorrentFile(new Blob([torrentData]))
+      } catch {
+        await this.db.delete(this.cacheNS, hash)
+      }
     }
 
     this._initialized = true
